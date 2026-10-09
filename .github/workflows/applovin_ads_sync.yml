@@ -1,42 +1,46 @@
 name: AppLovin Ads → BigQuery (UA spend)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AppLovin ADS = advertiser / UA side (spend, installs).  NOT MAX revenue.
+# AppLovin ADS = advertiser / UA side (spend, installs, creatives, ...). NOT MAX revenue.
 # MAX revenue lives in the separate repo bigquery-terafort/Applovin, untouched.
-# Own repo, own secret, own dataset (terafort.applovin_ads).
+# Own repo, own secrets, own dataset (terafort.applovin_ads).
 #
-# Secrets this repo needs (Settings → Secrets and variables → Actions):
-#   APPLOVIN_ADS_REPORT_KEY   Report Key from the AppLovin ADS dashboard (not MAX)
-#   GCP_PROJECT               same value as in the Applovin repo
-#   GCP_CREDENTIALS_JSON      same service-account JSON as in the Applovin repo
+# Secrets (Settings → Secrets and variables → Actions):
+#   APPLOVIN_ADS_REPORT_KEY   required  Report Key from the AppLovin ADS dashboard (not MAX)
+#   GCP_PROJECT               required  same value as in the Applovin repo
+#   GCP_CREDENTIALS_JSON      required  same service-account JSON as in the Applovin repo
+#   APPLOVIN_ADS_MGMT_KEY     optional  Campaign Management API key  ┐ both set → campaign / creative-set /
+#   APPLOVIN_ADS_ACCOUNT_ID   optional  numeric AppLovin account id  ┘ asset snapshots + change history
 #
-# Repo = 3 files: applovin_ads_to_bigquery.py, requirements.txt, this workflow.
-# Every run re-pulls the last 45 days (AppLovin's API window) and replaces
-# them day by day, atomically, after reconciliation and the drift guard.
-# Idempotent: running it twice gives the same data.
+# Schedules
+#   every 2h at :23 UTC   core + cohort (the money tables), 40-min API budget
+#   daily at 07:47 UTC    everything (all 10 reports), after AppLovin settles yesterday (06:00 UTC)
+#                         Optional repo VARIABLE (Settings → Secrets and variables → Actions → Variables)
+#                         APPLOVIN_ADS_DAILY_REPORTS = comma list, to drop a report without a commit.
+# Every run re-pulls the last 45 days (the API's window) and replaces them day by day,
+# atomically, after reconciliation and the drift guard. Idempotent.
 # Job 2 (keepalive) stops GitHub's 60-day auto-disable of the schedule.
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
   schedule:
-    # Every 2 hours at :23 UTC (avoids the :00 GitHub cron rush), so a fresh
-    # load always lands < 2h before each 4-hourly unified refresh.
     - cron: '23 */2 * * *'
+    - cron: '47 7 * * *'
   workflow_dispatch:
     inputs:
       mode:
-        description: "load = normal · dry-run = fetch + checks, writes nothing · probe = test key/columns only"
+        description: "load = normal · dry-run = fetch + checks, writes nothing · probe = test keys/columns only"
         type: choice
         options: [load, dry-run, probe]
         default: load
+      reports:
+        description: "all, or a comma list of: core,cohort,creative,supply,site,hourly,ska,probabilistic,assets,mgmt"
+        required: false
+        default: 'all'
       lookback_days:
         description: "Days back from today (max 44: AppLovin serves only the last 45 days)"
         required: false
         default: '44'
-      include_cohort:
-        description: "Also load the cohort table (revenue / retention by install day)"
-        type: boolean
-        default: true
       force_replace:
         description: "DANGER: replace days even if spend/installs changed >50% vs BigQuery (only after checking the AppLovin UI)"
         type: boolean
@@ -53,7 +57,8 @@ jobs:
   sync:
     name: AppLovin Ads → BigQuery
     runs-on: ubuntu-24.04           # pinned: ubuntu-latest moves to 26.04 from 19 Oct 2026
-    timeout-minutes: 60              # loader has its own 40-min budget and exits cleanly first
+    # 2-hourly run: 40-min API budget → 60 min. Daily / manual full run: 150-min budget → 180 min.
+    timeout-minutes: ${{ (github.event_name == 'schedule' && github.event.schedule == '23 */2 * * *') && 60 || 180 }}
 
     steps:
       - name: Checkout
@@ -81,6 +86,8 @@ jobs:
           K: ${{ secrets.APPLOVIN_ADS_REPORT_KEY }}
           P: ${{ secrets.GCP_PROJECT }}
           C: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          MK: ${{ secrets.APPLOVIN_ADS_MGMT_KEY }}
+          MA: ${{ secrets.APPLOVIN_ADS_ACCOUNT_ID }}
           MODE: ${{ github.event.inputs.mode || 'load' }}
         run: |
           miss=0
@@ -92,19 +99,27 @@ jobs:
             [ -n "$P" ] || { echo "::error::Secret GCP_PROJECT is missing"; miss=1; }
             [ -n "$C" ] || { echo "::error::Secret GCP_CREDENTIALS_JSON is missing"; miss=1; }
           fi
-          [ "$miss" = "0" ] && echo "✅ secrets present (mode=$MODE)"
+          if [ -n "$MK" ] && [ -z "$MA" ]; then
+            echo "::warning::APPLOVIN_ADS_MGMT_KEY is set but APPLOVIN_ADS_ACCOUNT_ID is not: Campaign Management snapshots are skipped"
+          elif [ -z "$MK" ] && [ -n "$MA" ]; then
+            echo "::warning::APPLOVIN_ADS_ACCOUNT_ID is set but APPLOVIN_ADS_MGMT_KEY is not: Campaign Management snapshots are skipped"
+          fi
+          [ "$miss" = "0" ] && echo "✅ secrets present (mode=$MODE, campaign management: $([ -n "$MK" ] && [ -n "$MA" ] && echo on || echo off))"
           exit $miss
 
       - name: Run AppLovin Ads loader
         env:
           APPLOVIN_ADS_REPORT_KEY: ${{ secrets.APPLOVIN_ADS_REPORT_KEY }}
+          APPLOVIN_ADS_MGMT_KEY:   ${{ secrets.APPLOVIN_ADS_MGMT_KEY }}
+          APPLOVIN_ADS_ACCOUNT_ID: ${{ secrets.APPLOVIN_ADS_ACCOUNT_ID }}
           GCP_PROJECT:             ${{ secrets.GCP_PROJECT }}
           GCP_CREDENTIALS_JSON:    ${{ secrets.GCP_CREDENTIALS_JSON }}
           BQ_DATASET:              applovin_ads
           BQ_LOCATION:             US
           MODE:                    ${{ github.event.inputs.mode || 'load' }}
+          REPORTS:                 ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.reports || 'all') || (github.event.schedule == '47 7 * * *' && (vars.APPLOVIN_ADS_DAILY_REPORTS || 'all') || 'core,cohort') }}
+          RUN_BUDGET_SEC:          ${{ (github.event_name == 'schedule' && github.event.schedule == '23 */2 * * *') && '2400' || '9000' }}
           LOOKBACK_DAYS:           ${{ github.event.inputs.lookback_days || '44' }}
-          INCLUDE_COHORT:          ${{ github.event.inputs.include_cohort || 'true' }}
           FORCE_REPLACE:           ${{ github.event.inputs.force_replace || 'false' }}
           PYTHONUNBUFFERED:        '1'
         run: python applovin_ads_to_bigquery.py
@@ -112,11 +127,11 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   # GitHub silently disables scheduled workflows in a PUBLIC repo after 60 days
   # without a commit. Empty commit once 45 days have passed → timer reset.
-  # Plain git, no third-party action; only this job may push.
+  # Plain git, no third-party action; only this job may push; once a day.
   # ───────────────────────────────────────────────────────────────────────────
   keepalive:
     name: Keepalive (60-day rule)
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' && github.event.schedule == '47 7 * * *'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
