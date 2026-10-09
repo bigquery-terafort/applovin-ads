@@ -1,0 +1,140 @@
+name: AppLovin Ads → BigQuery (UA spend)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AppLovin ADS = advertiser / UA side (spend, installs).  NOT MAX revenue.
+# MAX revenue lives in the separate repo bigquery-terafort/Applovin, untouched.
+# Own repo, own secret, own dataset (terafort.applovin_ads).
+#
+# Secrets this repo needs (Settings → Secrets and variables → Actions):
+#   APPLOVIN_ADS_REPORT_KEY   Report Key from the AppLovin ADS dashboard (not MAX)
+#   GCP_PROJECT               same value as in the Applovin repo
+#   GCP_CREDENTIALS_JSON      same service-account JSON as in the Applovin repo
+#
+# Repo = 3 files: applovin_ads_to_bigquery.py, requirements.txt, this workflow.
+# Every run re-pulls the last 45 days (AppLovin's API window) and replaces
+# them day by day, atomically, after reconciliation and the drift guard.
+# Idempotent: running it twice gives the same data.
+# Job 2 (keepalive) stops GitHub's 60-day auto-disable of the schedule.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    # Every 2 hours at :23 UTC (avoids the :00 GitHub cron rush), so a fresh
+    # load always lands < 2h before each 4-hourly unified refresh.
+    - cron: '23 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "load = normal · dry-run = fetch + checks, writes nothing · probe = test key/columns only"
+        type: choice
+        options: [load, dry-run, probe]
+        default: load
+      lookback_days:
+        description: "Days back from today (max 44: AppLovin serves only the last 45 days)"
+        required: false
+        default: '44'
+      include_cohort:
+        description: "Also load the cohort table (revenue / retention by install day)"
+        type: boolean
+        default: true
+      force_replace:
+        description: "DANGER: replace days even if spend/installs changed >50% vs BigQuery (only after checking the AppLovin UI)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: applovin-ads-sync          # never two runs at once; never cancel a running write
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: AppLovin Ads → BigQuery
+    runs-on: ubuntu-24.04           # pinned: ubuntu-latest moves to 26.04 from 19 Oct 2026
+    timeout-minutes: 60              # loader has its own 40-min budget and exits cleanly first
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies (3 tries)
+        run: |
+          for i in 1 2 3; do
+            if pip install --disable-pip-version-check -q -r requirements.txt; then exit 0; fi
+            echo "::warning::pip install failed (try $i/3), retrying in $((i*15))s"
+            sleep $((i*15))
+          done
+          echo "::error::pip install failed 3 times"
+          exit 1
+
+      - name: Preflight (secrets present, values never printed)
+        env:
+          K: ${{ secrets.APPLOVIN_ADS_REPORT_KEY }}
+          P: ${{ secrets.GCP_PROJECT }}
+          C: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          MODE: ${{ github.event.inputs.mode || 'load' }}
+        run: |
+          miss=0
+          if [ -z "$K" ]; then
+            echo "::error::Secret APPLOVIN_ADS_REPORT_KEY is missing. Add the AppLovin ADS Report Key under Settings → Secrets and variables → Actions."
+            miss=1
+          fi
+          if [ "$MODE" != "probe" ]; then
+            [ -n "$P" ] || { echo "::error::Secret GCP_PROJECT is missing"; miss=1; }
+            [ -n "$C" ] || { echo "::error::Secret GCP_CREDENTIALS_JSON is missing"; miss=1; }
+          fi
+          [ "$miss" = "0" ] && echo "✅ secrets present (mode=$MODE)"
+          exit $miss
+
+      - name: Run AppLovin Ads loader
+        env:
+          APPLOVIN_ADS_REPORT_KEY: ${{ secrets.APPLOVIN_ADS_REPORT_KEY }}
+          GCP_PROJECT:             ${{ secrets.GCP_PROJECT }}
+          GCP_CREDENTIALS_JSON:    ${{ secrets.GCP_CREDENTIALS_JSON }}
+          BQ_DATASET:              applovin_ads
+          BQ_LOCATION:             US
+          MODE:                    ${{ github.event.inputs.mode || 'load' }}
+          LOOKBACK_DAYS:           ${{ github.event.inputs.lookback_days || '44' }}
+          INCLUDE_COHORT:          ${{ github.event.inputs.include_cohort || 'true' }}
+          FORCE_REPLACE:           ${{ github.event.inputs.force_replace || 'false' }}
+          PYTHONUNBUFFERED:        '1'
+        run: python applovin_ads_to_bigquery.py
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # GitHub silently disables scheduled workflows in a PUBLIC repo after 60 days
+  # without a commit. Empty commit once 45 days have passed → timer reset.
+  # Plain git, no third-party action; only this job may push.
+  # ───────────────────────────────────────────────────────────────────────────
+  keepalive:
+    name: Keepalive (60-day rule)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Empty commit if the last commit is 45+ days old
+        run: |
+          set -euo pipefail
+          last=$(git log -1 --format=%ct)
+          days=$(( ($(date +%s) - last) / 86400 ))
+          echo "Days since last commit: ${days}"
+          if [ "${days}" -ge 45 ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keepalive (automated)"
+            git push
+            echo "keepalive commit pushed"
+          fi
